@@ -387,6 +387,7 @@ impl<P: PairingEngine, D: Digest> UnivariatePolynomialCommitment<P, D> {
 mod tests {
     use super::*;
     use ark_bls12_381::Bls12_381;
+    use ark_poly::{GeneralEvaluationDomain, Evaluations};
     use ark_std::rand::{rngs::StdRng, SeedableRng};
     use blake2::Blake2b;
 
@@ -475,5 +476,71 @@ mod tests {
             &eval_proof
         )
         .unwrap());
+    }
+   
+    #[test]
+    fn grid_poly_commit_test() {
+        let mut rng = StdRng::seed_from_u64(0u64);
+
+        //Imagine columns are pieces
+        const NUM_COLUMNS: usize = 128;
+        //Number of rows is then the number of KZG chunks in a piece
+        const NUM_ROWS: usize = 32;
+
+        //Generate some random public parameters
+        let public_parameters =
+            TestBivariatePolyCommitment::setup(&mut rng, NUM_COLUMNS-1, NUM_ROWS-1)
+                .unwrap();
+
+        //Verifier key is just a subset of public parameters
+        let verifier_key = public_parameters.0.get_verifier_key();
+
+        //Get some data
+        let mut data = Vec::new();
+
+        let piece_domain: GeneralEvaluationDomain<<Bls12_381 as PairingEngine>::Fr> =
+            ark_poly::domain::EvaluationDomain::<<Bls12_381 as PairingEngine>::Fr>::new(NUM_ROWS).unwrap();
+    
+        let mut column_polynomials = Vec::new();
+
+        for x in 0..NUM_COLUMNS{
+            let mut column_polynomial_evals = vec![];
+            for _ in 0..NUM_ROWS {
+                column_polynomial_evals.push(<Bls12_381 as PairingEngine>::Fr::rand(&mut rng));
+            }
+            data.push(column_polynomial_evals);
+            
+            let poly_evals = Evaluations::from_vec_and_domain(
+                data[x].iter().copied().collect(),
+                piece_domain,
+            );
+            
+            column_polynomials.push(poly_evals.interpolate());
+        }
+        assert_eq!(data.len(), NUM_COLUMNS);
+
+        //This is a single polynomial in 2 variables x,y that represents all data
+        let grid_polynomial = BivariatePolynomial { y_polynomials: column_polynomials };
+
+        // Commit to grid polynomial outputs the outer commitment and all column commitments
+        let (comm, column_comms) =
+            TestBivariatePolyCommitment::commit(&public_parameters, &grid_polynomial).unwrap();
+
+        // Evaluate at challenge point
+        let point = (UniformRand::rand(&mut rng), UniformRand::rand(&mut rng));
+        let eval_proof = TestBivariatePolyCommitment::open(
+            &public_parameters,
+            &grid_polynomial,
+            &column_comms,
+            &point,
+        )
+        .unwrap();
+
+        let eval = grid_polynomial.evaluate(&point);
+
+        // Verify proof
+        assert!(
+            TestBivariatePolyCommitment::verify(&verifier_key, &comm, &point, &eval, &eval_proof).unwrap()
+        );
     }
 }
