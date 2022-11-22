@@ -547,6 +547,7 @@ mod tests {
 
     type TestBivariatePolyCommitment = BivariatePolynomialCommitment<Bls12_381, Blake2b>;
     type TestUnivariatePolyCommitment = UnivariatePolynomialCommitment<Bls12_381, Blake2b>;
+    type TestTwoTierPolyCommitment = TwoTierPolynomialCommitment<Bls12_381, Blake2b>;
 
     #[test]
     fn bivariate_poly_commit_test() {
@@ -689,6 +690,73 @@ mod tests {
         // Verify proof
         assert!(
             TestBivariatePolyCommitment::verify(&verifier_key, &comm, &point, &eval, &eval_proof).unwrap()
+        );
+    }
+
+    #[test]
+    fn two_tier_commit_test() {
+        let mut rng = StdRng::seed_from_u64(0u64);
+
+        //Imagine columns are pieces
+        const NUM_COLUMNS: usize = 128;
+        //Number of rows is then the number of KZG chunks in a piece
+        const NUM_ROWS: usize = 32768;
+
+        //Generate some random public parameters
+        let public_parameters =
+            TestTwoTierPolyCommitment::setup(&mut rng, NUM_COLUMNS-1, NUM_ROWS-1)
+                .unwrap();
+
+        //Verifier key is just a subset of public parameters
+        let verifier_key = public_parameters.0.get_verifier_key();
+
+        //Get some data
+        let mut data = Vec::new();
+
+        let piece_domain: GeneralEvaluationDomain<<Bls12_381 as PairingEngine>::Fr> =
+            ark_poly::domain::EvaluationDomain::<<Bls12_381 as PairingEngine>::Fr>::new(NUM_ROWS).unwrap();
+    
+        let mut column_polynomials = Vec::new();
+
+        for x in 0..NUM_COLUMNS{
+            let mut column_polynomial_evals = vec![];
+            for _ in 0..NUM_ROWS {
+                column_polynomial_evals.push(<Bls12_381 as PairingEngine>::Fr::rand(&mut rng));
+            }
+            data.push(column_polynomial_evals);
+            
+            let poly_evals = Evaluations::from_vec_and_domain(
+                data[x].iter().copied().collect(),
+                piece_domain,
+            );
+            
+            column_polynomials.push(poly_evals.interpolate());
+        }
+        assert_eq!(data.len(), NUM_COLUMNS);
+
+        // KZG commit to column polynomials (each separately)
+        let column_comms = column_polynomials
+            .iter()
+            .map(|poly| TestTwoTierPolyCommitment::inner_commit(&public_parameters, poly))
+            .collect::<Result<Vec<<Bls12_381 as PairingEngine>::G1Projective>, Error>>().unwrap();
+    
+        //IPP commit to the commitments
+        let ip_comm = TestTwoTierPolyCommitment::outer_commit(&public_parameters, &column_comms).unwrap();    
+
+        // Evaluate at challenge point
+        let point = (3, 4);
+        
+        let eval_proof = TestTwoTierPolyCommitment::prove(
+            &public_parameters,
+            &column_polynomials[point.0],
+            &column_comms,
+            &point,
+        )
+        .unwrap();
+
+        // Verify proof
+        assert!(
+            TestTwoTierPolyCommitment::verify(&verifier_key, &ip_comm, &point, &NUM_ROWS, &data[point.0][point.1], &eval_proof).unwrap()
         );
     }
 }
