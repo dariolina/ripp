@@ -1,8 +1,8 @@
 use ark_ec::{msm::VariableBaseMSM, PairingEngine, ProjectiveCurve};
 use ark_ff::{Field, One, PrimeField, UniformRand, Zero};
-use ark_poly::polynomial::{
+use ark_poly::{polynomial::{
     univariate::DensePolynomial as UnivariatePolynomial, Polynomial, UVPolynomial,
-};
+}, GeneralEvaluationDomain, EvaluationDomain};
 
 use ark_std::{end_timer, start_timer};
 use std::marker::PhantomData;
@@ -146,6 +146,7 @@ pub struct OpeningProof<P: PairingEngine, D: Digest> {
     ip_proof: PolynomialEvaluationSecondTierIPAProof<P, D>,
     y_eval_comm: P::G1Projective,
     kzg_proof: P::G1Projective,
+    kzg_comm: Option<P::G1Projective>
 }
 
 pub struct BivariatePolynomialCommitment<P: PairingEngine, D: Digest> {
@@ -265,6 +266,7 @@ impl<P: PairingEngine, D: Digest> BivariatePolynomialCommitment<P, D> {
             ip_proof,
             y_eval_comm,
             kzg_proof,
+            kzg_comm:None
         })
     }
 
@@ -380,6 +382,152 @@ impl<P: PairingEngine, D: Digest> UnivariatePolynomialCommitment<P, D> {
         let y = point.clone();
         let x = y.pow(&vec![(y_degree + 1) as u64]);
         BivariatePolynomialCommitment::verify(v_srs, com, &(x, y), eval, proof)
+    }
+}
+pub struct TwoTierPolynomialCommitment<P: PairingEngine, D: Digest> {
+    _pairing: PhantomData<P>,
+    _digest: PhantomData<D>,
+}
+
+impl<P: PairingEngine, D: Digest> TwoTierPolynomialCommitment<P, D> {
+    pub fn setup<R: Rng>(
+        rng: &mut R,
+        x_degree: usize,
+        y_degree: usize,
+    ) -> Result<(SRS<P>, Vec<P::G1Affine>), Error> {
+        let alpha = <P::Fr>::rand(rng);
+        let beta = <P::Fr>::rand(rng);
+        let g = <P::G1Projective>::prime_subgroup_generator();
+        let h = <P::G2Projective>::prime_subgroup_generator();
+        let kzg_srs = <P as PairingEngine>::G1Projective::batch_normalization_into_affine(
+            &structured_generators_scalar_power(y_degree + 1, &g, &alpha),
+        );
+        let srs = SRS {
+            g_alpha_powers: vec![g.clone()],
+            h_beta_powers: structured_generators_scalar_power(2 * x_degree + 1, &h, &beta),
+            g_beta: g.mul(beta.into_repr()),
+            h_alpha: h.mul(alpha.into_repr()),
+        };
+        Ok((srs, kzg_srs))
+    }
+
+    pub fn inner_commit(
+        srs: &(SRS<P>, Vec<P::G1Affine>),
+        column_polynomial: &UnivariatePolynomial<P::Fr>,
+    ) -> Result<P::G1Projective, Error> {
+        let (_, kzg_srs) = srs;
+
+        // Create KZG commitments to Y polynomial
+        let column_comm= KZG::<P>::commit(kzg_srs, column_polynomial)?;
+
+        Ok(
+            column_comm
+        )
+    }
+
+    pub fn outer_commit(
+        srs: &(SRS<P>, Vec<P::G1Affine>),
+        column_comms: &Vec<P::G1Projective>,
+    ) -> Result<ExtensionFieldElement<P>, Error> {
+        let (ip_srs, _) = srs;
+        let (ck, _) = ip_srs.get_commitment_keys();
+        assert!(ck.len() >= column_comms.len());
+
+        // Create AFGHO commitment to Y polynomial commitments
+        Ok(
+            AFGHOCommitmentG1::<P>::commit(&ck, &column_comms)?
+        )
+    }
+
+    pub fn prove(
+        srs: &(SRS<P>, Vec<P::G1Affine>),
+        column_polynomial: &UnivariatePolynomial<P::Fr>,
+        column_comms: &Vec<P::G1Projective>,
+        point: &(usize, usize),
+    ) -> Result<OpeningProof<P, D>, Error> {
+        let kzg_domain: GeneralEvaluationDomain<P::Fr> =
+            ark_poly::domain::EvaluationDomain::<P::Fr>::new(column_polynomial.len()).unwrap();
+    
+        let x = P::Fr::from_le_bytes_mod_order(&point.0.to_le_bytes());
+        let y= kzg_domain.element(point.1);
+
+        let (ip_srs, kzg_srs) = srs;
+        let (commit_key, _) = ip_srs.get_commitment_keys();
+        assert!(commit_key.len() >= column_comms.len());
+
+        let precomp_time = start_timer!(|| "Computing outer KZG commitment");
+        let mut powers_of_x = vec![];
+        let mut cur = P::Fr::one();
+        for _ in 0..(commit_key.len()) {
+            powers_of_x.push(cur);
+            cur *= x;
+        }
+
+        let u_comm = VariableBaseMSM::multi_scalar_mul(
+            &column_comms
+                .iter()
+                .map(|c| c.into_affine())
+                .collect::<Vec<_>>(),
+            &powers_of_x
+                .iter()
+                .map(|b| b.into_repr())
+                .collect::<Vec<_>>(),
+        );
+        end_timer!(precomp_time);
+
+        let ipa_time = start_timer!(|| "Computing IPA proof");
+        let ip_proof =
+            PolynomialEvaluationSecondTierIPA::<P, D>::prove_with_structured_scalar_message(
+                &ip_srs,
+                (column_comms, &powers_of_x),
+                (&commit_key, &HomomorphicPlaceholderValue),
+            )?;
+        end_timer!(ipa_time);
+
+        let kzg_time = start_timer!(|| "Computing KZG opening proof");
+        let kzg_proof = KZG::<P>::open(
+            kzg_srs,
+            column_polynomial,
+            &y,
+        )?;
+        end_timer!(kzg_time);
+
+        Ok(OpeningProof {
+            ip_proof,
+            y_eval_comm:u_comm,
+            kzg_proof,
+            kzg_comm:Some(column_comms[point.0])
+        })
+    }
+
+    pub fn verify(
+        v_srs: &VerifierSRS<P>,
+        sector_comm: &ExtensionFieldElement<P>,
+        point: &(usize, usize),
+        kzg_num_values: &usize,
+        eval: &P::Fr,
+        proof: &OpeningProof<P, D>,
+    ) -> Result<bool, Error> {
+        let kzg_domain: GeneralEvaluationDomain<P::Fr> =
+            ark_poly::domain::EvaluationDomain::<P::Fr>::new(*kzg_num_values).unwrap();
+       
+        let x = P::Fr::from_le_bytes_mod_order(&point.0.to_le_bytes());
+        let y= kzg_domain.element(point.1);
+    
+        let ip_proof_valid =
+            PolynomialEvaluationSecondTierIPA::<P, D>::verify_with_structured_scalar_message(
+                v_srs,
+                &HomomorphicPlaceholderValue,
+                (sector_comm, &IdentityOutput(vec![proof.y_eval_comm.clone()])),
+                &x,
+                &proof.ip_proof,
+            )?;
+
+        let kzg_proof_valid =
+            KZG::<P>::verify(v_srs, &proof.kzg_comm.unwrap(), &y, eval, &proof.kzg_proof)?;
+
+        Ok(ip_proof_valid && kzg_proof_valid)
+        
     }
 }
 
